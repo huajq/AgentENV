@@ -62,6 +62,7 @@ pub fn build_snapshot_backend(
             Ok(OssBackend::from_parts(
                 oss_config,
                 snapshot_image_storage,
+                &config.snapshot.publish_compression,
                 cache,
                 shared_cache_root.join("runtime"),
                 overlaybd_layers,
