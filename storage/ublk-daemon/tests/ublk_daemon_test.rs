@@ -722,6 +722,7 @@ mod client_tests {
                 DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
                 DaemonRequest::UpdateSize { .. } => DaemonResponse::SizeUpdated,
                 DaemonRequest::NotifySandboxReady { .. } => DaemonResponse::Ok,
+                DaemonRequest::Prefetch { .. } => DaemonResponse::Ok,
             }
         }))
         .await;

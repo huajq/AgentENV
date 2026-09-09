@@ -22,6 +22,7 @@ use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
+use super::pagedump::export_process_gpa_ranges;
 use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
 use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
@@ -48,6 +49,9 @@ use crate::sandbox::ublk::{
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{
+    parse_prefetch_manifest, MemoryPrefetchFile, MEMORY_PREFETCH_ARTIFACT, MEMORY_PREFETCH_VERSION,
+};
 use crate::types::SandboxId;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -352,6 +356,11 @@ impl SandboxBackend for FirecrackerSandbox {
             .map_err(SandboxCaptureError::from)?;
         let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
 
+        // Best-effort: export envd's resident GPA ranges for the resume-time
+        // memory prefetch. Runs before the VM is paused; any failure is
+        // logged and ignored (the snapshot itself must never depend on it).
+        self.write_memory_prefetch_file(snapshot_dir.clone()).await;
+
         let (_, manifest) = match self.pause_to_dir(&snapshot_dir).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -520,6 +529,80 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    /// Best-effort: if a memory prefetch manifest was resolved for this
+    /// launch, ask the ublk daemon to bulk-prefetch those GPA ranges into the
+    /// local remote-block cache before the guest resumes. Silent no-op on any
+    /// failure.
+    async fn trigger_memory_prefetch(
+        prefetch_path: &Path,
+        mem_image_config_path: &Path,
+        mem_global_config_path: &Path,
+    ) {
+        let Ok(bytes) = tokio::fs::read(prefetch_path).await else {
+            return;
+        };
+        let Some(ranges) = parse_prefetch_manifest(&bytes) else {
+            return;
+        };
+        UblkDeviceManager::global()
+            .prefetch(mem_image_config_path, mem_global_config_path, ranges)
+            .await;
+    }
+
+    /// Best-effort: write the envd memory prefetch manifest into the snapshot
+    /// artifact dir (next to vm_state.bin). Silent no-op on any failure.
+    async fn write_memory_prefetch_file(&self, snapshot_dir: PathBuf) {
+        let Some(envd_instance) = self.envd_instance.clone() else {
+            return;
+        };
+        // `SandboxExecutor::run_command` borrows its arguments, so the export
+        // future is never `'static`. Drive it on a dedicated current-thread
+        // runtime inside `spawn_blocking` (the same pattern the overlaybd
+        // prefetch replay uses), keeping this method's future `Send`. The
+        // executor is constructed *inside* that runtime: using one built on
+        // the main runtime here would hang the export.
+        // Bound the whole export: a wedged envd or a pathological VMA must
+        // never stall the capture path. The timeout runs *inside* block_on so
+        // the export future is cancelled on timeout and the blocking thread
+        // (and its runtime) actually exits instead of lingering.
+        let ranges = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build pagedump export runtime");
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    export_process_gpa_ranges(envd_instance, "envd".to_string()),
+                )
+                .await
+                .ok()
+                .flatten()
+            })
+        })
+        .await
+        .unwrap_or_default();
+        let Some(ranges) = ranges else {
+            return;
+        };
+        let file = MemoryPrefetchFile {
+            version: MEMORY_PREFETCH_VERSION,
+            ranges,
+        };
+        let Ok(bytes) = serde_json::to_vec_pretty(&file) else {
+            return;
+        };
+        if let Err(error) = tokio::fs::create_dir_all(&snapshot_dir).await {
+            debug!(%error, "memory prefetch: create artifact dir failed");
+            return;
+        }
+        if let Err(error) =
+            tokio::fs::write(snapshot_dir.join(MEMORY_PREFETCH_ARTIFACT), &bytes).await
+        {
+            debug!(%error, "memory prefetch: write manifest failed");
+        }
+    }
+
     async fn recover_capture_failure<T>(
         &mut self,
         operation: &'static str,
@@ -1103,6 +1186,7 @@ impl FirecrackerSandbox {
             mem_overlaybd_config,
             mem_virtual_size,
             managed_snapshot_root: None,
+            memory_prefetch_path: None,
         };
 
         debug!(
@@ -1889,6 +1973,18 @@ impl FirecrackerSandbox {
             Some(config.mem_overlaybd_config.image_config_path.clone());
         self.mem_ublk_device = Some(mem_device);
 
+        // Best-effort: if a memory prefetch manifest was resolved for this
+        // launch, ask the daemon to bulk-prefetch envd's GPA ranges into the
+        // local remote-block cache before the guest resumes.
+        if let Some(prefetch_path) = &config.memory_prefetch_path {
+            Self::trigger_memory_prefetch(
+                prefetch_path,
+                &config.mem_overlaybd_config.image_config_path,
+                &global_config.memory_snapshot.overlaybd_global_config_path,
+            )
+            .await;
+        }
+
         if needs_socket_wait {
             self.fc_instance
                 .wait_for_ready(
@@ -2576,6 +2672,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            memory_prefetch_path: None,
         });
 
         assert_eq!(
@@ -2607,6 +2704,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            memory_prefetch_path: None,
         };
 
         let child = FirecrackerSandbox::from_snapshot_config_with_override(
@@ -2659,6 +2757,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            memory_prefetch_path: None,
         })?;
         let common = value["common"]
             .as_object_mut()

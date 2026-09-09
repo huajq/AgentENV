@@ -12,6 +12,7 @@ use overlaybd::config::{ImageConfig, UpperConfig, UpperMode};
 use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
+use overlaybd::virtual_file::VirtualFile;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -559,6 +560,20 @@ async fn handle_connection(
             overlaybd::download_gate::notify_sandbox_ready(&device_key);
             Ok(DaemonResponse::Ok)
         }
+        DaemonRequest::Prefetch {
+            image_config,
+            global_config,
+            ranges,
+        } => {
+            handle_prefetch(
+                &pool_state,
+                &image_service_cache,
+                &image_config,
+                &global_config,
+                ranges,
+            )
+            .await
+        }
         DaemonRequest::AcquireOverlaybd {
             image_config,
             global_config,
@@ -812,6 +827,99 @@ async fn create_overlaybd_device(
         "overlaybd device created"
     );
     Ok((dev_id, device_path))
+}
+
+// ── Memory prefetch ─────────────────────────────────────────────────────────
+
+const PREFETCH_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+const PREFETCH_CONCURRENCY: usize = 6;
+
+async fn handle_prefetch(
+    pool_state: &Option<Arc<PoolState>>,
+    image_service_cache: &ImageServiceCache,
+    image_config: &Path,
+    global_config: &Path,
+    ranges: Vec<(u64, u64)>,
+) -> Result<DaemonResponse> {
+    let image_service = image_service_cache
+        .get_or_create(global_config)
+        .await
+        .context("resolve image service for memory prefetch")?;
+    // Hold the per-image read lock while opening, matching every other image
+    // open in the daemon (restack takes the write side).
+    let image_lock = pool_state
+        .as_ref()
+        .map(|pool| pool.image_lock(image_config));
+    let _image_guard = match &image_lock {
+        Some(lock) => Some(lock.read().await),
+        None => None,
+    };
+    let image = Arc::new(
+        image_service
+            .create_image_file(image_config)
+            .await
+            .with_context(|| {
+                format!(
+                    "open overlaybd image for prefetch: {}",
+                    image_config.display()
+                )
+            })?,
+    );
+    let chunks = chunk_ranges(&ranges, PREFETCH_CHUNK_BYTES);
+    let total_bytes: u64 = chunks.iter().map(|(_, len)| len).sum();
+    tracing::info!(
+        image_config = %image_config.display(),
+        chunks = chunks.len(),
+        total_bytes,
+        "start memory prefetch"
+    );
+    tokio::spawn(prefetch_chunks(image, chunks));
+    Ok(DaemonResponse::Ok)
+}
+
+fn chunk_ranges(ranges: &[(u64, u64)], max_chunk: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(start, len) in ranges {
+        let mut offset = start;
+        let mut remaining = len;
+        while remaining > 0 {
+            let take = remaining.min(max_chunk);
+            out.push((offset, take));
+            offset += take;
+            remaining -= take;
+        }
+    }
+    out
+}
+
+async fn prefetch_chunks(image: Arc<ImageFile>, chunks: Vec<(u64, u64)>) {
+    let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+        chunks,
+    )));
+    let mut workers = Vec::new();
+    for _ in 0..PREFETCH_CONCURRENCY {
+        let image = Arc::clone(&image);
+        let queue = Arc::clone(&queue);
+        workers.push(tokio::spawn(async move {
+            loop {
+                let next = queue.lock().await.pop_front();
+                let Some((offset, len)) = next else { return };
+                match image.read_at(offset, len as usize).await {
+                    Ok(bytes) => {
+                        metrics::counter!("agentenv_ublk_prefetch_bytes_total")
+                            .increment(bytes.len() as u64);
+                    }
+                    Err(error) => {
+                        metrics::counter!("agentenv_ublk_prefetch_errors_total").increment(1);
+                        tracing::debug!(%error, offset, len, "prefetch chunk failed");
+                    }
+                }
+            }
+        }));
+    }
+    for worker in workers {
+        let _ = worker.await;
+    }
 }
 
 async fn handle_delete(
@@ -1635,6 +1743,33 @@ fn clear_page_cache(device_path: &Path) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn chunk_ranges_splits_and_preserves_order() {
+        let chunks = chunk_ranges(
+            &[(0, 12 * 1024 * 1024), (16 * 1024 * 1024, 4096)],
+            4 * 1024 * 1024,
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                (0, 4 * 1024 * 1024),
+                (4 * 1024 * 1024, 4 * 1024 * 1024),
+                (8 * 1024 * 1024, 4 * 1024 * 1024),
+                (16 * 1024 * 1024, 4096),
+            ]
+        );
+    }
+
+    #[test]
+    fn chunk_ranges_handles_small_and_empty_ranges() {
+        assert!(chunk_ranges(&[], 1024).is_empty());
+        assert_eq!(
+            chunk_ranges(&[(100, 10), (200, 5)], 1024),
+            vec![(100, 10), (200, 5)]
+        );
+        assert_eq!(chunk_ranges(&[(0, 0)], 1024), Vec::<(u64, u64)>::new());
+    }
 
     /// Minimal local `ImageService`; placeholder images have no lowers, so this
     /// is never used for registry access.
