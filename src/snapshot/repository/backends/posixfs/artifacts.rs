@@ -82,7 +82,18 @@ impl PosixFsArtifactStore {
                         warn!(%error, "import memory prefetch artifact failed (best-effort)");
                     }
                 }
-                false => debug!("no memory prefetch manifest captured"),
+                false => {
+                    debug!("no memory prefetch manifest captured");
+                    // A publication retry after a crash/failed cleanup reuses
+                    // the snapshot directory; a stale manifest from an earlier
+                    // attempt must not be associated with the new memory image.
+                    let stale = committed_layout.path(MEMORY_PREFETCH_ARTIFACT);
+                    if stale.exists() {
+                        if let Err(error) = fs::remove_file(&stale) {
+                            warn!(%error, path = %stale.display(), "remove stale memory prefetch artifact failed (best-effort)");
+                        }
+                    }
+                }
             }
         }
         self.persist_firecracker_manifest(

@@ -352,8 +352,29 @@ impl SnapshotRepository for OssSnapshotRepository {
                             );
                         }
                     }
-                    Err(_) => {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         debug!(snapshot_id = %id, "no memory prefetch manifest captured");
+                        // A publication retry after a crash may leave a stale
+                        // manifest from an earlier attempt; drop it so the new
+                        // memory image is not associated with old ranges.
+                        if let Err(error) = self
+                            .client
+                            .delete(&layout.artifact_key(MEMORY_PREFETCH_ARTIFACT))
+                            .await
+                        {
+                            debug!(
+                                %error,
+                                snapshot_id = %id,
+                                "delete stale memory prefetch artifact failed (best-effort)"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        debug!(
+                            %error,
+                            snapshot_id = %id,
+                            "read memory prefetch manifest failed; keeping existing artifact"
+                        );
                     }
                 }
             }

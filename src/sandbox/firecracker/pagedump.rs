@@ -5,15 +5,18 @@
 //! `None`, and the caller simply proceeds without a prefetch manifest.
 //!
 //! The export runs the static `aenv-pagedump` binary shipped in the tools
-//! drive (`/agentenv/bin/aenv-pagedump`): one process that reads
-//! `/proc/<pid>/maps` and `/proc/<pid>/pagemap` directly and prints the GPA
-//! ranges as JSON. When the binary is unavailable (older tools drives), the
-//! export fails and the snapshot silently gets no prefetch manifest.
+//! drive (`/agentenv/bin/aenv-pagedump`) directly (no shell or pgrep
+//! dependency): one process that resolves the target by name, reads
+//! `/proc/<pid>/maps` and `/proc/<pid>/pagemap`, and prints the GPA ranges
+//! as JSON. When the binary is unavailable (older tools drives), the export
+//! fails and the snapshot silently gets no prefetch manifest.
+
+use std::time::Duration;
 
 use tracing::{debug, warn};
 
 use crate::sandbox::envd::EnvdInstance;
-use crate::sandbox::process::Executor;
+use crate::sandbox::process::{Executor, ProcessOpts};
 use crate::snapshot::{MAX_PREFETCH_BYTES, MAX_PREFETCH_RANGES};
 
 /// Export the present GPA ranges of `process_name` inside the sandbox.
@@ -28,29 +31,33 @@ pub(crate) async fn export_process_gpa_ranges(
     process_name: String,
 ) -> Option<Vec<(u64, u64)>> {
     let exec = Executor::new(envd_instance);
-    let ps = exec
-        .run_command(
-            "sh",
-            &["-lc", &format!("pgrep -x {process_name} | head -1")],
-        )
+    // Run the tools-drive binary directly (no shell/pgrep dependency): it
+    // resolves the process name itself. The timeout kills a stalled dump so
+    // it cannot linger into the snapshot.
+    let opts = ProcessOpts::new().with_timeout(Duration::from_secs(5));
+    let out = exec
+        .run_command_with_opts("/agentenv/bin/aenv-pagedump", &[&process_name], &opts)
         .await
         .ok()?;
-    if ps.exit_code != 0 {
-        debug!(process_name, "prefetch export: process not found in guest");
+    if out.exit_code != 0 {
+        debug!(
+            process_name,
+            "prefetch export: aenv-pagedump unavailable or failed"
+        );
         return None;
     }
-    let pid = ps.stdout.trim().parse::<u32>().ok()?;
-
-    let Some(ranges) = export_via_pagedump_binary(&exec, pid).await else {
-        debug!(pid, "prefetch export: aenv-pagedump unavailable or failed");
-        return None;
-    };
-    debug!(pid, "prefetch export: exported via aenv-pagedump binary");
+    let ranges = parse_pagedump_output(&out.stdout).ok()?;
     if ranges.is_empty() {
         return None;
     }
+    debug!(
+        process_name,
+        "prefetch export: exported via aenv-pagedump binary"
+    );
 
-    let total_bytes: u64 = ranges.iter().map(|(_, len)| len).sum();
+    let total_bytes = ranges
+        .iter()
+        .try_fold(0u64, |acc, (_, len)| acc.checked_add(*len))?;
     if ranges.len() > MAX_PREFETCH_RANGES || total_bytes > MAX_PREFETCH_BYTES {
         warn!(
             ranges = ranges.len(),
@@ -59,21 +66,6 @@ pub(crate) async fn export_process_gpa_ranges(
         return None;
     }
     Some(ranges)
-}
-
-/// Run the tools-drive binary and parse its JSON output.
-async fn export_via_pagedump_binary(exec: &Executor, pid: u32) -> Option<Vec<(u64, u64)>> {
-    let out = exec
-        .run_command(
-            "sh",
-            &["-lc", &format!("/agentenv/bin/aenv-pagedump {pid}")],
-        )
-        .await
-        .ok()?;
-    if out.exit_code != 0 {
-        return None;
-    }
-    parse_pagedump_output(&out.stdout).ok()
 }
 
 fn parse_pagedump_output(text: &str) -> Result<Vec<(u64, u64)>, serde_json::Error> {

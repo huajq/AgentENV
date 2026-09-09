@@ -16,7 +16,8 @@ pub const MEMORY_PREFETCH_VERSION: u32 = 1;
 /// Parse and validate a prefetch manifest body. Returns the GPA ranges when
 /// the manifest is usable, or `None` when it is malformed, has an unknown
 /// version, is empty, or exceeds the caps (any of which silently disables
-/// the prefetch).
+/// the prefetch). Ranges are normalized (sorted and coalesced) before being
+/// returned, so unsorted or overlapping input cannot cause duplicate reads.
 pub fn parse_prefetch_manifest(bytes: &[u8]) -> Option<Vec<(u64, u64)>> {
     let file: MemoryPrefetchFile = serde_json::from_slice(bytes).ok()?;
     if file.version != MEMORY_PREFETCH_VERSION || file.ranges.is_empty() {
@@ -41,7 +42,29 @@ pub fn parse_prefetch_manifest(bytes: &[u8]) -> Option<Vec<(u64, u64)>> {
     if total_bytes > MAX_PREFETCH_BYTES {
         return None;
     }
-    Some(file.ranges)
+    Some(normalize_ranges(file.ranges))
+}
+
+/// Sort ranges by start and coalesce overlapping or adjacent ones, so the
+/// consumer always sees sorted, non-overlapping ranges regardless of the
+/// order the producer emitted them in.
+fn normalize_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, len) in ranges {
+        if len == 0 {
+            continue;
+        }
+        if let Some((last_start, last_len)) = out.last_mut() {
+            let last_end = *last_start + *last_len;
+            if start <= last_end {
+                *last_len = (*last_len).max(start + len - *last_start);
+                continue;
+            }
+        }
+        out.push((start, len));
+    }
+    out
 }
 
 /// Pages of a specific guest process (envd) that were resident at capture
@@ -75,6 +98,12 @@ mod tests {
         let back: MemoryPrefetchFile = serde_json::from_str(&s).unwrap();
         assert_eq!(back.version, MEMORY_PREFETCH_VERSION);
         assert_eq!(back.ranges, vec![(4096, 8192)]);
+    }
+
+    #[test]
+    fn parse_prefetch_manifest_normalizes_unsorted_overlapping_ranges() {
+        let bytes = br#"{"version":1,"ranges":[[8192,4096],[4096,8192],[12288,4096],[0,0]]}"#;
+        assert_eq!(parse_prefetch_manifest(bytes), Some(vec![(4096, 12288)]));
     }
 
     #[test]

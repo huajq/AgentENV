@@ -538,6 +538,21 @@ impl FirecrackerSandbox {
         mem_image_config_path: &Path,
         mem_global_config_path: &Path,
     ) {
+        // Bound the read: a corrupt or oversized artifact must never cause an
+        // unbounded allocation. Anything larger than a few MiB of JSON cannot
+        // be a valid manifest anyway (it is capped at 4096 ranges).
+        const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+        let Ok(meta) = tokio::fs::metadata(prefetch_path).await else {
+            return;
+        };
+        if meta.len() > MAX_MANIFEST_BYTES {
+            warn!(
+                path = %prefetch_path.display(),
+                size = meta.len(),
+                "memory prefetch manifest too large; skipping"
+            );
+            return;
+        }
         let Ok(bytes) = tokio::fs::read(prefetch_path).await else {
             return;
         };
@@ -566,10 +581,13 @@ impl FirecrackerSandbox {
         // the export future is cancelled on timeout and the blocking thread
         // (and its runtime) actually exits instead of lingering.
         let ranges = tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("build pagedump export runtime");
+            else {
+                tracing::debug!("memory prefetch: failed to build export runtime");
+                return None;
+            };
             runtime.block_on(async {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
@@ -585,6 +603,13 @@ impl FirecrackerSandbox {
         let Some(ranges) = ranges else {
             return;
         };
+        // Translate guest-physical addresses into memory-image file offsets.
+        // The identity holds only for the first Firecracker memory region
+        // (GPA < 3328 MiB); above that, RAM lives in a second region that is
+        // laid out sequentially in the snapshot memory file after the first
+        // region (Firecracker x86 memory layout). envd pages are almost always
+        // in low memory, but translate correctly regardless.
+        let ranges = Self::translate_gpa_ranges_to_file_offsets(ranges);
         let file = MemoryPrefetchFile {
             version: MEMORY_PREFETCH_VERSION,
             ranges,
@@ -601,6 +626,34 @@ impl FirecrackerSandbox {
         {
             debug!(%error, "memory prefetch: write manifest failed");
         }
+    }
+
+    /// Translate guest-physical address ranges into memory-image file offsets.
+    ///
+    /// Firecracker's x86 memory layout: region 1 covers GPA [0, 3328 MiB) and is
+    /// stored at file offset 0; region 2 starts at GPA 64 GiB and is stored
+    /// sequentially right after region 1 (file offset 3328 MiB). Ranges below
+    /// 3328 MiB pass through unchanged; ranges at or above 64 GiB are remapped.
+    /// (Ranges can never straddle the gap [3328 MiB, 64 GiB) — there is no RAM
+    /// there, so such input is dropped as invalid.)
+    fn translate_gpa_ranges_to_file_offsets(ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        const REGION1_END: u64 = 3328 * 1024 * 1024; // 3328 MiB
+        const REGION2_START: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
+        ranges
+            .into_iter()
+            .filter_map(|(start, len)| {
+                let end = start.checked_add(len)?;
+                if end <= REGION1_END {
+                    Some((start, len))
+                } else if start >= REGION2_START {
+                    // (start - 64 GiB) + 3328 MiB — cannot underflow given the check.
+                    Some((start - REGION2_START + REGION1_END, len))
+                } else {
+                    // Inside the architectural gap: no RAM there.
+                    None
+                }
+            })
+            .collect()
     }
 
     async fn recover_capture_failure<T>(
@@ -2991,5 +3044,43 @@ mod tests {
             .to_string()
             .contains("ensure start() was called before pause() or snapshot"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gpa_offset_tests {
+    use super::FirecrackerSandbox;
+
+    #[test]
+    fn low_gpas_pass_through() {
+        assert_eq!(
+            FirecrackerSandbox::translate_gpa_ranges_to_file_offsets(vec![
+                (4096, 8192),
+                (0x1000_0000, 4096)
+            ]),
+            vec![(4096, 8192), (0x1000_0000, 4096)]
+        );
+    }
+
+    #[test]
+    fn high_region_is_remapped_sequentially() {
+        const GIB64: u64 = 64 * 1024 * 1024 * 1024;
+        const MIB3328: u64 = 3328 * 1024 * 1024;
+        assert_eq!(
+            FirecrackerSandbox::translate_gpa_ranges_to_file_offsets(vec![
+                (GIB64, 4096),
+                (GIB64 + 4096, 8192)
+            ]),
+            vec![(MIB3328, 4096), (MIB3328 + 4096, 8192)]
+        );
+    }
+
+    #[test]
+    fn gap_ranges_are_dropped() {
+        const MIB3328: u64 = 3328 * 1024 * 1024;
+        assert!(
+            FirecrackerSandbox::translate_gpa_ranges_to_file_offsets(vec![(MIB3328, 4096)])
+                .is_empty()
+        );
     }
 }

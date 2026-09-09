@@ -834,6 +834,9 @@ async fn create_overlaybd_device(
 const PREFETCH_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 const PREFETCH_CONCURRENCY: usize = 6;
 
+const PREFETCH_MAX_RANGES: usize = 4096;
+const PREFETCH_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
 async fn handle_prefetch(
     pool_state: &Option<Arc<PoolState>>,
     image_service_cache: &ImageServiceCache,
@@ -841,39 +844,83 @@ async fn handle_prefetch(
     global_config: &Path,
     ranges: Vec<(u64, u64)>,
 ) -> Result<DaemonResponse> {
+    // Validate at the RPC boundary: never trust client-supplied ranges. A
+    // malicious or corrupt request must not expand into unbounded allocation
+    // or overflowing offset arithmetic.
+    if ranges.len() > PREFETCH_MAX_RANGES {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!(
+                "prefetch range count exceeds limit ({} > {})",
+                ranges.len(),
+                PREFETCH_MAX_RANGES
+            ),
+        });
+    }
+    if ranges
+        .iter()
+        .any(|(start, len)| start.checked_add(*len).is_none())
+    {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: "prefetch range overflows start + len".to_string(),
+        });
+    }
+    let total_bytes = match ranges
+        .iter()
+        .try_fold(0u64, |acc, (_, len)| acc.checked_add(*len))
+    {
+        Some(total) => total,
+        None => {
+            return Ok(DaemonResponse::InvalidRequest {
+                message: "prefetch total bytes overflow".to_string(),
+            })
+        }
+    };
+    if total_bytes > PREFETCH_MAX_TOTAL_BYTES {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!(
+                "prefetch total bytes exceed limit ({} > {})",
+                total_bytes, PREFETCH_MAX_TOTAL_BYTES
+            ),
+        });
+    }
+
     let image_service = image_service_cache
         .get_or_create(global_config)
         .await
         .context("resolve image service for memory prefetch")?;
     // Hold the per-image read lock while opening, matching every other image
-    // open in the daemon (restack takes the write side).
+    // open in the daemon (restack takes the write side). The open-time guard
+    // is scoped so the lock can then be moved into the background task and
+    // held for the whole prefetch, so a restack cannot mutate the image
+    // while reads are in flight.
     let image_lock = pool_state
         .as_ref()
         .map(|pool| pool.image_lock(image_config));
-    let _image_guard = match &image_lock {
-        Some(lock) => Some(lock.read().await),
-        None => None,
+    let image = {
+        let _open_guard = match &image_lock {
+            Some(lock) => Some(lock.read().await),
+            None => None,
+        };
+        Arc::new(
+            image_service
+                .create_image_file(image_config)
+                .await
+                .with_context(|| {
+                    format!(
+                        "open overlaybd image for prefetch: {}",
+                        image_config.display()
+                    )
+                })?,
+        )
     };
-    let image = Arc::new(
-        image_service
-            .create_image_file(image_config)
-            .await
-            .with_context(|| {
-                format!(
-                    "open overlaybd image for prefetch: {}",
-                    image_config.display()
-                )
-            })?,
-    );
     let chunks = chunk_ranges(&ranges, PREFETCH_CHUNK_BYTES);
-    let total_bytes: u64 = chunks.iter().map(|(_, len)| len).sum();
     tracing::info!(
         image_config = %image_config.display(),
         chunks = chunks.len(),
         total_bytes,
         "start memory prefetch"
     );
-    tokio::spawn(prefetch_chunks(image, chunks));
+    tokio::spawn(prefetch_chunks(image, chunks, image_lock));
     Ok(DaemonResponse::Ok)
 }
 
@@ -892,7 +939,17 @@ fn chunk_ranges(ranges: &[(u64, u64)], max_chunk: u64) -> Vec<(u64, u64)> {
     out
 }
 
-async fn prefetch_chunks(image: Arc<ImageFile>, chunks: Vec<(u64, u64)>) {
+async fn prefetch_chunks(
+    image: Arc<ImageFile>,
+    chunks: Vec<(u64, u64)>,
+    image_lock: Option<Arc<RwLock<()>>>,
+) {
+    // Hold the read guard for the whole prefetch: a restack must not acquire
+    // the write side and mutate the image while reads are in flight.
+    let _image_guard = match &image_lock {
+        Some(lock) => Some(lock.read().await),
+        None => None,
+    };
     let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
         chunks,
     )));
