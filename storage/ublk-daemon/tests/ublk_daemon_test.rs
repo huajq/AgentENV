@@ -13,7 +13,9 @@ use overlaybd::config::UpperMode;
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 
-use uvm_ublk_daemon::protocol::{recv_message, send_message, DaemonRequest, DaemonResponse};
+use uvm_ublk_daemon::protocol::{
+    recv_message, send_message, DaemonRequest, DaemonResponse, PackRecordingState,
+};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
     UblkDaemonClient,
@@ -724,6 +726,11 @@ mod client_tests {
                 DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
                 DaemonRequest::UpdateSize { .. } => DaemonResponse::SizeUpdated,
                 DaemonRequest::NotifySandboxReady { .. } => DaemonResponse::Ok,
+                DaemonRequest::StartPackRecording { .. } => DaemonResponse::Ok,
+                DaemonRequest::PackRecordingStatus { .. } => DaemonResponse::PackRecording {
+                    state: PackRecordingState::Recording,
+                },
+                DaemonRequest::AbortPackRecording { .. } => DaemonResponse::Ok,
             }
         }))
         .await;

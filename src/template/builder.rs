@@ -131,6 +131,25 @@ impl TemplateBuilder {
             .unwrap_or(u32::MAX);
 
         info!("publishing template snapshot");
+        // Best-effort: spawn the startup-manifest recording now so the
+        // throwaway recording VM overlaps the backend's layer uploads (a
+        // no-op task when the feature is disabled or the backend carries no
+        // capture payload); a detached continuation uploads the manifest once
+        // the trace lands.
+        let recording = build_execution
+            .capture_artifacts
+            .and_then(|artifacts| {
+                artifacts
+                    .downcast::<crate::sandbox::FirecrackerSnapshotConfig>()
+                    .ok()
+            })
+            .map(|snapshot_config| crate::snapshot::StartupRecording {
+                trace: tokio::spawn(crate::sandbox::record_startup_pack(
+                    *snapshot_config,
+                    build_execution.output_dir.clone(),
+                )),
+                keep_alive: Box::new(()),
+            });
         let record = snapshot_manager
             .publish(
                 SnapshotPublishMetadata {
@@ -150,6 +169,7 @@ impl TemplateBuilder {
                     custom_extension_params: None,
                 },
                 build_execution.manifest,
+                recording,
             )
             .await?;
 

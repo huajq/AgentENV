@@ -19,12 +19,13 @@ use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
 use storage_util::io_ring::IoRingHandle;
 use uvm_ublk::{
-    delete_dev, ublk_caps, wait_for_ublk_dev, OverlaybdTarget, UVMUblkCtrlBuilder, UVMUblkDev,
-    UVMUblkDevBuilder, UVMUblkTarget,
+    delete_dev, tmp_pack_path, ublk_caps, wait_for_ublk_dev, OverlaybdTarget, StartupPackRecorder,
+    UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget,
 };
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
+    ResizeToolSpec,
 };
 use crate::runtime;
 
@@ -33,6 +34,20 @@ use crate::runtime;
 struct ManagedDevice {
     dev: UVMUblkDev<OverlaybdTarget>,
     image: Arc<ImageFile>,
+}
+
+/// Tracks one startup pack recording attached to a device.
+struct PackRecordingHandle {
+    /// Final pack output path (the `memory-startup.pack` artifact).
+    output: PathBuf,
+    state: Arc<std::sync::Mutex<PackRecordingState>>,
+    task: tokio::task::JoinHandle<()>,
+    /// Set by abort/delete/shutdown; the packaging pass checks it before the
+    /// final rename so a cancelled pack never lands at `output`.
+    cancelled: Arc<AtomicBool>,
+    /// Held by the window task while packaging runs; abort cleanup acquires
+    /// it so file removal never races an in-flight finalize rename.
+    finalize_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 // ── Pooled device wrapper ───────────────────────────────────────────────────
@@ -263,6 +278,7 @@ pub struct UblkDaemonServer {
     /// all share the single isolated resize cacheDir, so only one may run at
     /// a time.
     resize_permit: Arc<Mutex<()>>,
+    pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>,
     shutdown: Arc<Notify>,
 }
 
@@ -311,6 +327,7 @@ impl UblkDaemonServer {
             resize_tool: None,
             resize_global_config,
             resize_permit: Arc::new(Mutex::new(())),
+            pack_recordings: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -396,6 +413,7 @@ impl UblkDaemonServer {
                     let resize_tool = self.resize_tool.clone();
                     let resize_global_config = self.resize_global_config.clone();
                     let resize_permit = Arc::clone(&self.resize_permit);
+                    let pack_recordings = Arc::clone(&self.pack_recordings);
                     let shutdown = Arc::clone(&self.shutdown);
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
@@ -407,6 +425,7 @@ impl UblkDaemonServer {
                             resize_tool,
                             resize_global_config,
                             resize_permit,
+                            pack_recordings,
                             shutdown,
                         ).await {
                             tracing::error!(?err, "daemon connection handler failed");
@@ -435,6 +454,15 @@ impl UblkDaemonServer {
     }
 
     async fn stop_all_devices(&self) {
+        // Abort pack recordings first so a window task cannot finalize into a
+        // device that is being stopped, and no tmp pack files survive.
+        let recording_ids: Vec<u32> = self.pack_recordings.iter().map(|r| *r.key()).collect();
+        for dev_id in recording_ids {
+            if let Some((_, handle)) = self.pack_recordings.remove(&dev_id) {
+                abort_pack_recording_handle(&handle).await;
+            }
+        }
+
         let dev_ids: Vec<u32> = self.devices.iter().map(|r| *r.key()).collect();
         for dev_id in dev_ids {
             if let Some((_, mut device)) = self.devices.remove(&dev_id) {
@@ -493,6 +521,7 @@ async fn handle_connection(
     resize_tool: Option<ResizeToolSpec>,
     resize_global_config: PathBuf,
     resize_permit: Arc<Mutex<()>>,
+    pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
@@ -545,7 +574,9 @@ async fn handle_connection(
             )
             .await
         }
-        DaemonRequest::Delete { dev_id } => handle_delete(&devices, ctrl_ring, dev_id).await,
+        DaemonRequest::Delete { dev_id } => {
+            handle_delete(&devices, ctrl_ring, &pack_recordings, dev_id).await
+        }
         DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path,
@@ -558,6 +589,34 @@ async fn handle_connection(
             );
             overlaybd::download_gate::notify_sandbox_ready(&device_key);
             Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::StartPackRecording {
+            dev_id,
+            output,
+            max_pages,
+            min_window_ms,
+            quiet_ms,
+            max_window_ms,
+        } => {
+            handle_start_pack_recording(
+                &devices,
+                &pack_recordings,
+                dev_id,
+                PackRecordingParams {
+                    output,
+                    max_pages,
+                    min_window: Duration::from_millis(min_window_ms),
+                    quiet: Duration::from_millis(quiet_ms),
+                    max_window: Duration::from_millis(max_window_ms),
+                },
+            )
+            .await
+        }
+        DaemonRequest::PackRecordingStatus { dev_id } => {
+            handle_pack_recording_status(&pack_recordings, dev_id)
+        }
+        DaemonRequest::AbortPackRecording { dev_id } => {
+            handle_abort_pack_recording(&devices, &pack_recordings, dev_id).await
         }
         DaemonRequest::AcquireOverlaybd {
             image_config,
@@ -817,14 +876,20 @@ async fn create_overlaybd_device(
 async fn handle_delete(
     devices: &DashMap<u32, ManagedDevice>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
     dev_id: u32,
 ) -> Result<DaemonResponse> {
+    // Abort any pack recording first: its window task must not finalize into
+    // a deleted device's image, and its pack files must not leak.
+    if let Some((_, handle)) = pack_recordings.remove(&dev_id) {
+        abort_pack_recording_handle(&handle).await;
+    }
+
     let Some((_, mut device)) = devices.remove(&dev_id) else {
         bail!("device {dev_id} not found");
     };
 
     quiesce_managed_device(&mut device).await;
-
     // ManagedDevice contains a open fd to the ublk char dev.
     // We need to drop it first, or else, the DEL_DEV command will stuck
     drop(device);
@@ -839,6 +904,250 @@ async fn handle_delete(
 
 async fn quiesce_managed_device(device: &mut ManagedDevice) {
     quiesce_ublk_device(&mut device.dev).await;
+}
+
+// ── Startup pack recording ──────────────────────────────────────────────────
+
+const PACK_RECORDING_TICK: Duration = Duration::from_millis(100);
+
+/// Window/guard/output parameters for one pack recording (kept as a struct
+/// so handler and window task stay within argument-count lints).
+struct PackRecordingParams {
+    output: PathBuf,
+    max_pages: u32,
+    min_window: Duration,
+    quiet: Duration,
+    max_window: Duration,
+}
+
+async fn handle_start_pack_recording(
+    devices: &DashMap<u32, ManagedDevice>,
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
+    dev_id: u32,
+    params: PackRecordingParams,
+) -> Result<DaemonResponse> {
+    // Replace a finished handle, but never interrupt a live recording.
+    if let Some(existing) = pack_recordings.get(&dev_id) {
+        let finished = !matches!(
+            *existing.state.lock().expect("recording state poisoned"),
+            PackRecordingState::Recording
+        );
+        if !finished {
+            return Ok(DaemonResponse::InvalidRequest {
+                message: format!("pack recording already active on device {dev_id}"),
+            });
+        }
+        drop(existing);
+        pack_recordings.remove(&dev_id);
+    }
+
+    if params.max_pages == 0 {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: "max_pages must be > 0".to_string(),
+        });
+    }
+    if params.quiet.is_zero() {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: "quiet_ms must be > 0".to_string(),
+        });
+    }
+    if params.min_window > params.max_window {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!(
+                "min_window_ms {} exceeds max_window_ms {}",
+                params.min_window.as_millis(),
+                params.max_window.as_millis()
+            ),
+        });
+    }
+    let Some(parent) = params.output.parent() else {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("pack output {} has no parent dir", params.output.display()),
+        });
+    };
+    if !parent.exists() {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("pack output dir {} does not exist", parent.display()),
+        });
+    }
+
+    let Some(device) = devices.get(&dev_id) else {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("device {dev_id} not found"),
+        });
+    };
+    let (target, image) = (Arc::clone(device.dev.target()), Arc::clone(&device.image));
+    drop(device);
+
+    let mem_virtual_size = image.size_bytes();
+    let max_pages =
+        (params.max_pages as usize).min(overlaybd::startup_pack::MAX_PACK_PAGES as usize);
+    let recorder = Arc::new(StartupPackRecorder::new(mem_virtual_size, max_pages));
+    target.set_recorder(Some(Arc::clone(&recorder)));
+    let output = params.output.clone();
+    tracing::info!(
+        dev_id,
+        output = %output.display(),
+        mem_virtual_size,
+        max_pages,
+        "startup pack recording armed"
+    );
+
+    let state = Arc::new(std::sync::Mutex::new(PackRecordingState::Recording));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let finalize_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let task = tokio::spawn(pack_recording_window(
+        Arc::clone(&recorder),
+        target,
+        params,
+        Arc::clone(&state),
+        Arc::clone(&cancelled),
+        Arc::clone(&finalize_gate),
+    ));
+    pack_recordings.insert(
+        dev_id,
+        Arc::new(PackRecordingHandle {
+            output,
+            state,
+            task,
+            cancelled,
+            finalize_gate,
+        }),
+    );
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_pack_recording_status(
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
+    dev_id: u32,
+) -> Result<DaemonResponse> {
+    let Some(handle) = pack_recordings.get(&dev_id) else {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("no pack recording on device {dev_id}"),
+        });
+    };
+    let state = handle
+        .state
+        .lock()
+        .expect("recording state poisoned")
+        .clone();
+    Ok(DaemonResponse::PackRecording { state })
+}
+
+/// Cancel one recording and remove its pack files deterministically: the
+/// packaging pass checks `cancelled` before the final rename, and the
+/// finalize gate makes sure an in-flight rename has settled before any file
+/// removal runs — so a cancelled pack never survives cleanup, while a pack
+/// that completed before the cancel is preserved.
+async fn abort_pack_recording_handle(handle: &PackRecordingHandle) {
+    handle.cancelled.store(true, Ordering::Relaxed);
+    handle.task.abort();
+    let _gate = handle.finalize_gate.lock().await;
+    let done = matches!(
+        *handle.state.lock().expect("recording state poisoned"),
+        PackRecordingState::Done { .. }
+    );
+    let _ = std::fs::remove_file(tmp_pack_path(&handle.output));
+    if !done {
+        let _ = std::fs::remove_file(&handle.output);
+    }
+}
+
+async fn handle_abort_pack_recording(
+    devices: &DashMap<u32, ManagedDevice>,
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
+    dev_id: u32,
+) -> Result<DaemonResponse> {
+    let Some((_, handle)) = pack_recordings.remove(&dev_id) else {
+        return Ok(DaemonResponse::Ok);
+    };
+    if let Some(device) = devices.get(&dev_id) {
+        device.dev.target().set_recorder(None);
+    }
+    abort_pack_recording_handle(&handle).await;
+    Ok(DaemonResponse::Ok)
+}
+
+async fn pack_recording_window(
+    recorder: Arc<StartupPackRecorder>,
+    target: Arc<OverlaybdTarget>,
+    params: PackRecordingParams,
+    state: Arc<std::sync::Mutex<PackRecordingState>>,
+    cancelled: Arc<AtomicBool>,
+    finalize_gate: Arc<tokio::sync::Mutex<()>>,
+) {
+    use uvm_ublk::RecordingVerdict;
+
+    let mut ticker = tokio::time::interval(PACK_RECORDING_TICK);
+    let verdict = loop {
+        ticker.tick().await;
+        let verdict = recorder.verdict(params.min_window, params.quiet, params.max_window);
+        if verdict != RecordingVerdict::Continue {
+            break verdict;
+        }
+    };
+
+    // Recording is over: detach first so no new read is observed.
+    target.set_recorder(None);
+    let output = params.output.clone();
+
+    // Finalizing writes the trace file synchronously; move it off the
+    // daemon's async executor (which also serves ublk device control).
+    let package = |params: &PackRecordingParams| {
+        let recorder = Arc::clone(&recorder);
+        let output = params.output.clone();
+        let cancelled = Arc::clone(&cancelled);
+        tokio::task::spawn_blocking(move || recorder.finalize(&output, &cancelled))
+    };
+
+    let state_value = match verdict {
+        RecordingVerdict::Fail(reason) => {
+            tracing::warn!(reason, "startup pack recording aborted by guard");
+            PackRecordingState::Failed {
+                reason: reason.to_string(),
+            }
+        }
+        RecordingVerdict::Finish => {
+            // Hold the gate across packaging so abort/delete/shutdown cleanup
+            // never removes files from under an in-flight finalize rename.
+            let _gate = finalize_gate.lock().await;
+            match package(&params).await {
+                Ok(Ok(outcome)) => {
+                    tracing::info!(
+                        output = %output.display(),
+                        pages = outcome.pages,
+                        bytes = outcome.bytes,
+                        remote_bytes = outcome.remote_bytes,
+                        skipped_high_pages = outcome.skipped_high_pages,
+                        "startup pack recorded"
+                    );
+                    PackRecordingState::Done {
+                        pages: outcome.pages,
+                        bytes: outcome.bytes,
+                        remote_bytes: outcome.remote_bytes,
+                        path: output,
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "startup pack packaging failed");
+                    let _ = std::fs::remove_file(tmp_pack_path(&params.output));
+                    PackRecordingState::Failed {
+                        reason: format!("{error:#}"),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "startup pack packaging task failed");
+                    let _ = std::fs::remove_file(tmp_pack_path(&params.output));
+                    PackRecordingState::Failed {
+                        reason: format!("packaging task join failed: {error:#}"),
+                    }
+                }
+            }
+        }
+        RecordingVerdict::Continue => unreachable!("window loop only exits on a terminal verdict"),
+    };
+
+    *state.lock().expect("recording state poisoned") = state_value;
 }
 
 async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {

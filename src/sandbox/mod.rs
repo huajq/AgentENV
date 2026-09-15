@@ -30,10 +30,11 @@ pub use extra_drive::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
     validate_sub_path, ExtraDrive,
 };
+pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
-    FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool, FirecrackerRuntimePolicy,
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSandboxFactory,
-    FirecrackerSnapshotConfig,
+    FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
+    FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
+    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
 pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};

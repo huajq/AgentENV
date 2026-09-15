@@ -320,11 +320,17 @@ impl SandboxBackend for MockSandboxBackend {
     async fn capture_to_dir(
         &mut self,
         _at: &std::path::Path,
-    ) -> SandboxCaptureResult<crate::sandbox::SandboxSnapshotManifest> {
+    ) -> SandboxCaptureResult<(
+        crate::sandbox::SandboxSnapshotManifest,
+        Option<Box<dyn std::any::Any + Send>>,
+    )> {
         self.behavior
             .apply_capture_result(MockOperation::CaptureToDir)
             .await?;
-        Ok(crate::sandbox::SandboxSnapshotManifest::for_test(4096, &[]))
+        Ok((
+            crate::sandbox::SandboxSnapshotManifest::for_test(4096, &[]),
+            None,
+        ))
     }
 
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {

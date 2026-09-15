@@ -262,8 +262,15 @@ pub trait SandboxBackend: Send + 'static {
     ///
     /// The guest is left held. A template build takes its snapshot this way
     /// and stops the sandbox afterwards, so unlike [`snapshot`][Self::snapshot]
-    /// nothing is resumed and the directory is the caller's to keep.
-    async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<SandboxSnapshotManifest>;
+    /// nothing is resumed and the directory is the caller's to keep. The
+    /// optional second tuple element carries the backend's opaque capture
+    /// payload for consumers that need backend-specific capture state (e.g.
+    /// startup-manifest recording re-booting from the capture); `None` for
+    /// backends without one.
+    async fn capture_to_dir(
+        &mut self,
+        at: &Path,
+    ) -> SandboxCaptureResult<(SandboxSnapshotManifest, Option<Box<dyn Any + Send>>)>;
 
     /// Stop the sandbox and release all associated system resources.
     ///

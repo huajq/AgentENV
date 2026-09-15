@@ -9,7 +9,8 @@ use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
+    RestackSnapshotStats,
 };
 use overlaybd::config::UpperMode;
 
@@ -387,6 +388,67 @@ impl UblkDaemonClient {
                 bail!("daemon: notify sandbox ready failed: {message}")
             }
             other => bail!("daemon: unexpected response for notify sandbox ready: {other:?}"),
+        }
+    }
+
+    /// Arm a startup-pack first-touch recorder on `dev_id`. When the
+    /// recording window ends the daemon packages the recorded pages into
+    /// `output` and reports the result through [`Self::pack_recording_status`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_pack_recording(
+        &self,
+        dev_id: u32,
+        output: &Path,
+        max_pages: u32,
+        min_window_ms: u64,
+        quiet_ms: u64,
+        max_window_ms: u64,
+    ) -> Result<()> {
+        let request = DaemonRequest::StartPackRecording {
+            dev_id,
+            output: output.to_path_buf(),
+            max_pages,
+            min_window_ms,
+            quiet_ms,
+            max_window_ms,
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::InvalidRequest { message } => {
+                bail!("daemon: start pack recording rejected: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: start pack recording failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for start pack recording: {other:?}"),
+        }
+    }
+
+    /// Poll the state of the pack recording running on `dev_id`.
+    pub async fn pack_recording_status(&self, dev_id: u32) -> Result<PackRecordingState> {
+        let request = DaemonRequest::PackRecordingStatus { dev_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::PackRecording { state } => Ok(state),
+            DaemonResponse::InvalidRequest { message } => {
+                bail!("daemon: pack recording status rejected: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: pack recording status failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for pack recording status: {other:?}"),
+        }
+    }
+
+    /// Abort the pack recording on `dev_id` (idempotent): detach the
+    /// recorder, stop the window task, and remove any partial pack output.
+    pub async fn abort_pack_recording(&self, dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::AbortPackRecording { dev_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error { message } => {
+                bail!("daemon: abort pack recording failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for abort pack recording: {other:?}"),
         }
     }
 

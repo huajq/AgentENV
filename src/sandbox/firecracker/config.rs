@@ -466,6 +466,12 @@ pub struct FirecrackerSnapshotConfig {
     /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
     #[serde(skip)]
     pub(super) managed_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Marks a throwaway VM booted only to record the startup memory pack at
+    /// publish time: the memory device becomes dedicated (never shared or
+    /// pooled), the pack recorder is armed before the snapshot loads, and
+    /// custom-extension hooks are suppressed. Runtime-only, never persisted.
+    #[serde(skip)]
+    pub pack_recording: bool,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -551,6 +557,7 @@ impl FirecrackerSnapshotConfig {
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
+            pack_recording: false,
         })
     }
 
@@ -878,6 +885,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            pack_recording: false,
         };
 
         let err = snapshot

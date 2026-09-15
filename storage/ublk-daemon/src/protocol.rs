@@ -55,6 +55,29 @@ pub enum DaemonRequest {
     NotifySandboxReady {
         device_key: String,
     },
+    /// Arm a startup-pack first-touch recorder on an existing device and
+    /// start the recording window state machine. When the window ends the
+    /// daemon writes the recorded first-touch trace into `output`
+    /// (atomically, via a `.tmp` sibling) and reports the result through
+    /// `PackRecordingStatus`.
+    StartPackRecording {
+        dev_id: u32,
+        /// Trace output path (the `memory-startup.trace` intermediate).
+        output: PathBuf,
+        max_pages: u32,
+        min_window_ms: u64,
+        quiet_ms: u64,
+        max_window_ms: u64,
+    },
+    /// Poll the state of the pack recording running on `dev_id`.
+    PackRecordingStatus {
+        dev_id: u32,
+    },
+    /// Abort a pack recording (idempotent): detach the recorder, stop the
+    /// window task, and remove any partial pack output.
+    AbortPackRecording {
+        dev_id: u32,
+    },
     /// Acquire a warm overlaybd device from the pool.
     AcquireOverlaybd {
         image_config: PathBuf,
@@ -101,6 +124,22 @@ pub enum AccessMode {
     Shared,
 }
 
+/// State of a daemon-side startup pack recording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PackRecordingState {
+    Recording,
+    Done {
+        pages: u32,
+        bytes: u64,
+        remote_bytes: u64,
+        path: PathBuf,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
@@ -133,6 +172,9 @@ pub enum DaemonResponse {
         /// Guest ext4 used bytes probed from the device, when it looks like ext4.
         #[serde(default)]
         ext4_used_bytes: Option<u64>,
+    },
+    PackRecording {
+        state: PackRecordingState,
     },
     Ok,
     TerminalError {

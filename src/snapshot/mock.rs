@@ -36,6 +36,7 @@ impl SnapshotRepository for MockSnapshotRepository {
         &self,
         _metadata: SnapshotPublishMetadata,
         _manifest: SandboxSnapshotManifest,
+        _recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
         Err(Self::unsupported())
     }

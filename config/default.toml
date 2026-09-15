@@ -244,6 +244,19 @@ algorithm = "lz4"
 # parallel without changing the output layout.
 workers = 1
 
+# OSS-backend only: record the guest's startup memory pages once per snapshot
+# at publish time (a short local re-resume on the capture node, ~10s budget),
+# upload a tiny v3 page manifest, and prefetch the listed positions
+# concurrently on cold resume. Pages not yet prefetched fall back to the
+# normal on-demand path immediately. `consume_enabled` only gates resume-side
+# [snapshot.memory_startup_pack]
+# enabled = false
+# record_min_window_ms = 200
+# record_quiet_ms = 300
+# record_max_window_ms = 2000
+# record_budget_secs = 10
+# max_pack_bytes = 1073741824
+
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.
 # [backend.posix_fs]

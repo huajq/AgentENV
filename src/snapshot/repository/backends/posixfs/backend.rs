@@ -143,6 +143,7 @@ impl PosixFsSnapshotRepository {
             volume_snapshots: metadata.volume_snapshots.clone(),
             memory_layers: built.memory_layers,
             disk_publications: Vec::new(),
+            memory_startup: None,
         }
     }
 
@@ -255,6 +256,7 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
+        _recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
         let repository = self.clone();
         run_repository_blocking("publish snapshot", move || {
@@ -597,7 +599,7 @@ mod tests {
         let local_artifacts = seed_built_snapshot(tempdir.path());
         let metadata = sample_metadata(snapshot_id, Some("mvp"));
         let stored = repository
-            .publish(metadata, local_artifacts)
+            .publish(metadata, local_artifacts, None)
             .await
             .expect("publish should work");
 
@@ -635,7 +637,7 @@ mod tests {
         let local_artifacts = seed_built_snapshot(tempdir.path());
         let first_metadata = sample_metadata(first_id.clone(), Some("conflict"));
         repository
-            .publish(first_metadata, local_artifacts)
+            .publish(first_metadata, local_artifacts, None)
             .await
             .expect("first publish should work");
 
@@ -645,6 +647,7 @@ mod tests {
             .publish(
                 sample_metadata(second_id.clone(), Some("conflict")),
                 local_artifacts,
+                None,
             )
             .await
             .expect_err("second publish should fail");
@@ -668,7 +671,7 @@ mod tests {
         let metadata = sample_metadata(snapshot_id.clone(), Some("cleanup"));
 
         repository
-            .publish(metadata, local_artifacts)
+            .publish(metadata, local_artifacts, None)
             .await
             .expect("publish should work");
 
@@ -771,7 +774,11 @@ mod tests {
             ],
         );
         let err = repository
-            .publish(sample_metadata(snapshot_id, Some("dup-drive")), manifest)
+            .publish(
+                sample_metadata(snapshot_id, Some("dup-drive")),
+                manifest,
+                None,
+            )
             .await
             .expect_err("duplicate attached drive ids should be rejected");
 
@@ -807,6 +814,7 @@ mod tests {
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            memory_startup: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));
 
@@ -865,6 +873,7 @@ mod tests {
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            memory_startup: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));
 

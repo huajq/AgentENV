@@ -28,11 +28,11 @@ use crate::snapshot::repository::{
     BuildCacheState, RepositoryError, RepositoryResult, VolumeRecordPage,
 };
 use crate::snapshot::{
-    CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
-    PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, MemoryStartupPackInfo,
+    OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotAlias, SnapshotId,
+    SnapshotListFilter, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
+    SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo,
+    TemplateBuildStatus, MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeStatus};
 
@@ -279,6 +279,7 @@ impl SnapshotRepository for OssSnapshotRepository {
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
         let id = &metadata.id;
         let layout = self.layout(id);
@@ -363,6 +364,11 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .await
                 .map_err(|e| RepositoryError::backend("write firecracker manifest to oss", e))?;
 
+            // The startup manifest is fully decoupled from this flow: the
+            // detached continuation spawned after the record commits builds
+            // and uploads it, then attaches the descriptor to the record.
+            let memory_startup = None;
+
             // 3. Export attached-drive disk images and derive their committed metadata.
             let attached_drives = self
                 .export_attached_drives(id, &manifest, &mut disk_publications)
@@ -381,6 +387,7 @@ impl SnapshotRepository for OssSnapshotRepository {
                 volume_snapshots: metadata.volume_snapshots.clone(),
                 memory_layers,
                 disk_publications: disk_publications.clone(),
+                memory_startup,
             };
 
             // 5. Bind alias (if present) with conflict detection.
@@ -430,6 +437,24 @@ impl SnapshotRepository for OssSnapshotRepository {
                 return Err(error);
             }
         };
+
+        // Fully decoupled startup manifest: the continuation joins the
+        // recording, builds and uploads the manifest, then attaches its
+        // descriptor to the record. Publish never waits on any of it.
+        if crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .enabled
+            && !crate::snapshot::startup_pack::startup_manifest_shutdown_requested()
+        {
+            if let Some(recording) = recording {
+                tokio::spawn(finish_startup_manifest(
+                    self.client.clone(),
+                    metadata.id.clone(),
+                    recording,
+                ));
+            }
+        }
 
         debug!(snapshot_id = %id, "published snapshot to oss");
         Ok(record)
@@ -1818,6 +1843,244 @@ fn validate_publish_manifest_image_configs(
         })?;
     }
     Ok(())
+}
+
+// ── Detached startup-manifest continuation ─────────────────────────────────
+
+/// Detached startup-manifest continuation: joins the recording, builds and
+/// uploads the manifest, then attaches its descriptor to the already
+/// committed record. Best-effort throughout — any failure only means the
+/// snapshot resumes on-demand.
+async fn finish_startup_manifest(
+    client: std::sync::Arc<OssClient>,
+    id: SnapshotId,
+    recording: crate::snapshot::StartupRecording,
+) {
+    let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+    // Hold the captured artifacts alive until the manifest is uploaded, and
+    // count this continuation for the shutdown drain.
+    let _keep_alive = keep_alive;
+    let _guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::new();
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    let trace_path = match tokio::select! {
+        joined = trace => joined,
+        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => return,
+    } {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            debug!(snapshot_id = %id, "startup manifest recording produced no trace");
+            return;
+        }
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup manifest recording join failed");
+            return;
+        }
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    let layout = OssSnapshotArtifactLayout::new(&id);
+    let Some(info) = build_and_upload_manifest(&client, &layout, &id, &trace_path).await else {
+        return;
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    attach_memory_startup_descriptor(&client, &id, info).await;
+}
+
+/// Best-effort: build the v3 startup manifest (exact-order prefix pages
+/// plus merged ranges) from the recorded first-touch trace and upload it.
+/// No layer bytes are read, packed, or uploaded — the resume side prefetches
+/// the listed positions through the normal read path.
+async fn build_and_upload_manifest(
+    client: &OssClient,
+    layout: &OssSnapshotArtifactLayout<'_>,
+    id: &SnapshotId,
+    trace_path: &std::path::Path,
+) -> Option<MemoryStartupPackInfo> {
+    let pack_config = &crate::cfg::ConfigManager::global_config()
+        .snapshot
+        .memory_startup_pack;
+    let build = async {
+        let trace = match tokio::fs::read(trace_path).await {
+            Ok(trace) => trace,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    debug!(
+                        %error,
+                        snapshot_id = %id,
+                        "read startup trace failed; publishing without a manifest"
+                    );
+                }
+                return None;
+            }
+        };
+        let (mem_virtual_size, offsets) = match overlaybd::startup_pack::decode_trace(&trace) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                warn!(
+                    %error,
+                    snapshot_id = %id,
+                    "startup trace undecodable; publishing without a manifest"
+                );
+                return None;
+            }
+        };
+        let manifest_doc =
+            match overlaybd::startup_manifest::build_manifest(mem_virtual_size, &offsets) {
+                Ok(doc) => doc,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        snapshot_id = %id,
+                        "build startup manifest failed (best-effort)"
+                    );
+                    return None;
+                }
+            };
+        let manifest_bytes = match overlaybd::startup_manifest::encode_manifest(&manifest_doc) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    %error,
+                    snapshot_id = %id,
+                    "encode startup manifest failed (best-effort)"
+                );
+                return None;
+            }
+        };
+        info!(
+            snapshot_id = %id,
+            pages = offsets.len(),
+            prefix_pages = manifest_doc.prefix_pages.len(),
+            ranges = manifest_doc.ranges.len(),
+            manifest_bytes = manifest_bytes.len(),
+            "startup manifest built"
+        );
+
+        let info = MemoryStartupPackInfo {
+            pack_size: manifest_bytes.len() as u64,
+            mem_virtual_size,
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(&manifest_bytes),
+        };
+        if let Err(error) = client
+            .put_bytes(
+                &layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT),
+                manifest_bytes,
+                OssUploadArtifact::StartupPack,
+            )
+            .await
+        {
+            warn!(
+                %error,
+                snapshot_id = %id,
+                "upload startup manifest failed (best-effort)"
+            );
+            return None;
+        }
+        Some(info)
+    }
+    .await;
+
+    if build.is_none() && pack_config.enabled {
+        delete_stale_startup_pack(client, layout, id).await;
+    }
+    build
+}
+
+/// Attach the uploaded manifest's descriptor to the committed record via a
+/// read-modify-write pass. Alibaba OSS has no conditional-write CAS on the
+/// S3-compatible path (see `bind_alias`), so a delete racing this update can
+/// resurrect the record — accepted with the same documented model as alias
+/// binding. A missing record (deleted meanwhile) aborts and drops the
+/// manifest instead of resurrecting anything.
+async fn attach_memory_startup_descriptor(
+    client: &OssClient,
+    id: &SnapshotId,
+    info: MemoryStartupPackInfo,
+) {
+    let layout = OssSnapshotArtifactLayout::new(id);
+    let cleanup_manifest = || async {
+        if let Err(error) = client
+            .delete(&layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT))
+            .await
+        {
+            debug!(%error, snapshot_id = %id, "delete manifest after aborted attach failed");
+        }
+    };
+    let record_key = OssSnapshotArtifactLayout::record_key(id);
+    let bytes = match client.get_bytes(&record_key).await {
+        Ok(bytes) => bytes,
+        Err(error) if OssClient::is_not_found_error(&error) => {
+            debug!(
+                snapshot_id = %id,
+                "record deleted while attaching startup manifest; dropping the manifest"
+            );
+            cleanup_manifest().await;
+            return;
+        }
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "read record for startup manifest attach failed");
+            return;
+        }
+    };
+    let mut record: SnapshotRecord = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "parse record for startup manifest attach failed");
+            return;
+        }
+    };
+    let Some(committed) = record.committed.as_mut() else {
+        cleanup_manifest().await;
+        return;
+    };
+    if committed.memory_startup.is_some() {
+        return;
+    }
+    committed.memory_startup = Some(info);
+    record.updated_at_unix_ms = now_unix_ms();
+    let bytes = match serde_json::to_vec_pretty(&record) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "serialize record for startup manifest attach failed");
+            return;
+        }
+    };
+    if let Err(error) = client
+        .put_bytes(&record_key, bytes, OssUploadArtifact::CatalogRecord)
+        .await
+    {
+        warn!(
+            %error,
+            snapshot_id = %id,
+            "attach startup manifest descriptor failed (best-effort)"
+        );
+    }
+}
+
+/// Clean a possible stale startup artifact when the feature expected one
+/// (a publish retry after a crash with recording enabled); a manifest-less
+/// publish with the feature off must not pay an extra OSS request. A None
+/// `memory_startup` descriptor already prevents consumption either way.
+async fn delete_stale_startup_pack(
+    client: &OssClient,
+    layout: &OssSnapshotArtifactLayout<'_>,
+    id: &SnapshotId,
+) {
+    if let Err(error) = client
+        .delete(&layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT))
+        .await
+    {
+        debug!(
+            %error,
+            snapshot_id = %id,
+            "delete stale startup pack failed (best-effort)"
+        );
+    }
 }
 
 #[cfg(test)]

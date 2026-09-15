@@ -8,7 +8,9 @@ use tracing::warn;
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
-use crate::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
+use crate::sandbox::{
+    CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
+};
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::SnapshotListFilter;
@@ -104,15 +106,16 @@ impl SnapshotManager {
         self.repository.create(record).await
     }
 
-    #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
+    #[tracing::instrument(skip(self, metadata, manifest, recording), fields(snapshot_id = %metadata.id))]
     pub async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let record = self
             .repository
-            .publish(metadata.clone(), manifest.clone())
+            .publish(metadata.clone(), manifest.clone(), recording)
             .await?;
         self.publish_p2p_artifacts(&record, &manifest).await;
         Ok(record)
@@ -126,9 +129,25 @@ impl SnapshotManager {
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let manifest = captured_snapshot.manifest().clone();
 
+        // Spawn the startup-manifest recording up front (a no-op task when
+        // the feature is disabled): the throwaway recording VM overlaps the
+        // backend's layer uploads, and a detached continuation uploads the
+        // manifest once the trace lands — publish never waits on it. The
+        // capture root guard travels with the task so the artifacts outlive
+        // the whole continuation.
+        let recording = captured_snapshot
+            .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
+            .map(|artifacts| crate::snapshot::StartupRecording {
+                trace: tokio::spawn(crate::sandbox::record_startup_pack(
+                    artifacts.snapshot_config().clone(),
+                    artifacts.snapshot_dir().to_path_buf(),
+                )),
+                keep_alive: Box::new(artifacts.snapshot_root_guard()),
+            });
+
         let record = self
             .repository
-            .publish(metadata.clone(), manifest.clone())
+            .publish(metadata.clone(), manifest.clone(), recording)
             .await?;
         self.publish_p2p_artifacts(&record, &manifest).await;
         Ok(record)
@@ -338,7 +357,7 @@ mod tests {
             ..SnapshotPublishMetadata::mock()
         };
         manager
-            .publish(metadata, manifest)
+            .publish(metadata, manifest, None)
             .await
             .expect("seed publish should work");
     }
@@ -418,7 +437,7 @@ mod tests {
         };
 
         manager
-            .publish(metadata, manifest)
+            .publish(metadata, manifest, None)
             .await
             .expect("publish should commit");
 

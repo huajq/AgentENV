@@ -35,7 +35,7 @@ pub(super) async fn test_api(
     let (_, _, manifest) = write_mock_built_artifacts(&root.path().join("artifacts"))?;
     let mut metadata = SnapshotPublishMetadata::mock();
     metadata.alias = Some(crate::snapshot::SnapshotAlias::parse("test-template")?);
-    let record = manager.publish(metadata, manifest).await?;
+    let record = manager.publish(metadata, manifest, None).await?;
     let orchestrator = Orchestrator::new(
         InMemoryMetadataStore::new(),
         FirecrackerSandboxFactory::new(),

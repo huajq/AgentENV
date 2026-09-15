@@ -150,10 +150,16 @@ pub trait SnapshotRepository: Send + Sync {
     /// On success, the returned [`SnapshotRecord`] must contain committed artifact state.
     /// On failure, callers may assume the backend attempted best-effort cleanup of partially published
     /// state, but durable shared artifacts may still be retained when doing so is safe and intentional.
+    ///
+    /// `recording`, when present, is the in-flight startup-manifest recording
+    /// for this snapshot; the backend awaits it after the layer uploads and
+    /// before building the manifest, so the recording VM overlaps the upload
+    /// phase instead of serializing ahead of it.
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord>;
 
     /// Loads one snapshot record by repository id or alias.

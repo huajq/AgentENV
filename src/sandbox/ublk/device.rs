@@ -10,6 +10,7 @@ use overlaybd::config::UpperMode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
+use uvm_ublk_daemon::protocol::PackRecordingState;
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
     UblkDaemonClient, UblkDaemonSpawnConfig,
@@ -22,6 +23,16 @@ use crate::sandbox::SandboxCaptureError;
 const UBLK_OPERATION_DURATION: &str = "agentenv_ublk_operation_duration_seconds";
 const RUNTIME_DEVICE_TIMEOUT: Duration = Duration::from_secs(360);
 const RESIZE_RPC_TIMEOUT_MARGIN: Duration = Duration::from_secs(120);
+
+/// Window and guard parameters for one startup pack recording, derived from
+/// `[snapshot.memory_startup_pack]` by the recording orchestration.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackRecordingWindow {
+    pub max_pages: u32,
+    pub min_window_ms: u64,
+    pub quiet_ms: u64,
+    pub max_window_ms: u64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UblkConfig {
@@ -355,6 +366,53 @@ impl UblkDeviceManager {
         })
     }
 
+    /// Create a dedicated (non-shared, non-pooled) overlaybd memory device for
+    /// a startup-pack recording VM. The device is created directly via the
+    /// daemon and is NOT registered in the shared-memory maps, so no other
+    /// sandbox can share it (sharing the block-device page cache would hide
+    /// first-touch reads from the recorder). It must always be released with
+    /// [`Self::delete_device`], never `release_device` — `release_device`
+    /// would return a non-pool device to the warm pool when pooling is
+    /// globally enabled.
+    pub(crate) async fn create_dedicated_mem_device(
+        &self,
+        spec: &UblkCreateSpec,
+    ) -> Result<UblkDevice> {
+        self.create_raw_overlaybd_device(spec).await
+    }
+
+    /// Arm a startup-pack first-touch recorder on a memory device.
+    pub(crate) async fn start_pack_recording(
+        &self,
+        dev_id: u32,
+        output: &Path,
+        window: PackRecordingWindow,
+    ) -> Result<()> {
+        let client = self.require_client()?;
+        client
+            .start_pack_recording(
+                dev_id,
+                output,
+                window.max_pages,
+                window.min_window_ms,
+                window.quiet_ms,
+                window.max_window_ms,
+            )
+            .await
+    }
+
+    /// Poll the state of the pack recording running on `dev_id`.
+    pub(crate) async fn pack_recording_status(&self, dev_id: u32) -> Result<PackRecordingState> {
+        let client = self.require_client()?;
+        client.pack_recording_status(dev_id).await
+    }
+
+    /// Abort the pack recording on `dev_id` (idempotent).
+    pub(crate) async fn abort_pack_recording(&self, dev_id: u32) -> Result<()> {
+        let client = self.require_client()?;
+        client.abort_pack_recording(dev_id).await
+    }
+
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
@@ -380,7 +438,12 @@ impl UblkDeviceManager {
     }
 
     /// Delete a ublk device via the daemon.
-    async fn delete_device(&self, device: &UblkDevice) -> Result<()> {
+    ///
+    /// This is also the release path for dedicated (non-pooled) memory
+    /// devices created with [`Self::create_dedicated_mem_device`]: those must
+    /// never go through `release_device`, which returns devices to the warm
+    /// pool when pooling is globally enabled.
+    pub(crate) async fn delete_device(&self, device: &UblkDevice) -> Result<()> {
         let client = self.require_client()?;
         let dev_id = device.dev_id;
         debug!(dev_id, "deleting ublk device via daemon");
@@ -780,6 +843,10 @@ pub(crate) struct UblkDevice {
 impl UblkDevice {
     pub fn device_path(&self) -> &Path {
         &self.device_path
+    }
+
+    pub fn dev_id(&self) -> u32 {
+        self.dev_id
     }
 }
 

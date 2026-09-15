@@ -46,6 +46,7 @@ pub(crate) enum OssUploadArtifact {
     MemoryLayer,
     VmState,
     FirecrackerManifest,
+    StartupPack,
     CatalogRecord,
     Alias,
 }
@@ -58,6 +59,7 @@ impl OssUploadArtifact {
             Self::MemoryLayer => "memory_layer",
             Self::VmState => "vm_state",
             Self::FirecrackerManifest => "manifest",
+            Self::StartupPack => "startup_pack",
             Self::CatalogRecord => "record",
             Self::Alias => "alias",
         }

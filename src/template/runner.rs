@@ -97,13 +97,29 @@ struct TemplateBuildInputs {
     tools_drive_version: String,
 }
 
-#[derive(Clone, Debug)]
 pub(crate) struct TemplateBuildExecution {
     pub runtime_versions: SnapshotRuntimeVersions,
     pub manifest: SandboxSnapshotManifest,
     pub build_context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub image_configs: ImageConfigs,
+    /// Backend capture payload from `capture_to_dir` (the build VM is already
+    /// stopped when this returns; startup-pack recording downcasts it to the
+    /// backend's snapshot config to re-boot from the capture).
+    pub capture_artifacts: Option<Box<dyn std::any::Any + Send>>,
+    /// Local capture output directory (holds vm_state.bin and the pack).
+    pub output_dir: PathBuf,
+}
+
+impl std::fmt::Debug for TemplateBuildExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemplateBuildExecution")
+            .field("runtime_versions", &self.runtime_versions)
+            .field("manifest", &self.manifest)
+            .field("startup", &self.startup)
+            .field("output_dir", &self.output_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TemplateBuildRunner {
@@ -276,7 +292,8 @@ impl TemplateBuildRunner {
                         .await?;
 
                         debug!("capturing template snapshot");
-                        let manifest = sandbox.capture_to_dir(&output_dir).await?;
+                        let (manifest, capture_artifacts) =
+                            sandbox.capture_to_dir(&output_dir).await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {
@@ -285,6 +302,8 @@ impl TemplateBuildRunner {
                             build_context,
                             startup,
                             image_configs,
+                            capture_artifacts,
+                            output_dir: output_dir.clone(),
                         })
                     }
                     .await;

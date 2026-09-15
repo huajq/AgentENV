@@ -356,6 +356,8 @@ pub struct SnapshotConfig {
     pub image_publish: SnapshotImagePublishConfig,
     #[config(nested)]
     pub publish_compression: SnapshotPublishCompressionConfig,
+    #[config(nested)]
+    pub memory_startup_pack: SnapshotStartupPackConfig,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -391,6 +393,34 @@ pub struct SnapshotPublishCompressionConfig {
 pub enum OssAddressingStyle {
     Path,
     Virtual,
+}
+
+/// Publish-time startup memory manifest (OSS backend only). Records the
+/// pages touched during a short local re-resume at capture, uploads a tiny
+/// v3 page manifest in first-touch order, and prefetches the listed
+/// positions concurrently on cold resume. Pages not yet prefetched fall back
+/// to the normal OverlayBD demand path immediately.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotStartupPackConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Minimum observation window after the recording device's first read.
+    #[config(default = 200u64)]
+    pub record_min_window_ms: u64,
+    /// Stop recording when no new page AND no in-flight read persists for
+    /// this long (in-flight reads never count as quiet).
+    #[config(default = 300u64)]
+    pub record_quiet_ms: u64,
+    /// Hard cap of the recording window.
+    #[config(default = 2000u64)]
+    pub record_max_window_ms: u64,
+    /// Best-effort budget for prepare + record + package; aborts the pack
+    /// (not the publish) when exceeded. Cleanup is NOT bounded by this.
+    #[config(default = 10u64)]
+    pub record_budget_secs: u64,
+    /// Per-pack page-data cap (hard truncation in the pack writer).
+    #[config(default = 1073741824u64)]
+    pub max_pack_bytes: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]

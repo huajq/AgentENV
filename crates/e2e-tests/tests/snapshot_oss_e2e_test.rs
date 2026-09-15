@@ -238,6 +238,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
                 custom_extension_params: None,
             },
             manifest,
+            None,
         )
         .await?;
 
@@ -372,6 +373,7 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
                 custom_extension_params: None,
             },
             manifest,
+            None,
         )
         .await?;
 
@@ -493,6 +495,7 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
                 custom_extension_params: None,
             },
             manifest,
+            None,
         )
         .await?;
 
@@ -556,6 +559,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
                 custom_extension_params: None,
             },
             manifest,
+            None,
         )
         .await?;
 
@@ -624,6 +628,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
                 custom_extension_params: None,
             },
             manifest,
+            None,
         )
         .await?;
 
