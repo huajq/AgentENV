@@ -74,12 +74,12 @@ fn premerged_index_cache_limit_bytes(cache_size_gb: u32) -> u64 {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ReadOnlyLayerMetadata {
-    pub(super) uuid: Uuid,
-    pub(super) file_size: u64,
-    pub(super) virtual_size: u64,
-    pub(super) index_offset: u64,
-    pub(super) index_size: u64,
+pub(crate) struct ReadOnlyLayerMetadata {
+    pub(crate) uuid: Uuid,
+    pub(crate) file_size: u64,
+    pub(crate) virtual_size: u64,
+    pub(crate) index_offset: u64,
+    pub(crate) index_size: u64,
     pub(super) header_version: u8,
     pub(super) header_sub_version: u8,
     pub(super) trailer_version: u8,

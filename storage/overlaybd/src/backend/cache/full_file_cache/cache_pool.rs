@@ -1231,6 +1231,21 @@ impl FileCacheBackend {
         )
     }
 
+    /// Register one startup pack prefetch with the backend's scheduler.
+    /// Concurrent submissions of the same immutable pack identity share one
+    /// task; the returned handle is a holder (the last drop on a live task
+    /// cancels it).
+    pub fn submit_startup_pack(
+        &self,
+        submission: super::super::startup_pack_task::StartupPackSubmission,
+    ) -> Result<super::super::bk_download::StartupPackHandle> {
+        let scheduler = self
+            .bk_scheduler
+            .upgrade()
+            .ok_or(super::super::BkDownloadSubmitError::Closed)?;
+        Ok(scheduler.submit_startup_pack(submission)?)
+    }
+
     /// Stop cache-owned background downloads and await active I/O drain.
     #[allow(dead_code)]
     pub(crate) async fn shutdown_bk_downloads(&self) {

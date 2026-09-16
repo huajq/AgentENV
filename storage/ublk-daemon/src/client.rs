@@ -452,6 +452,38 @@ impl UblkDaemonClient {
         }
     }
 
+    /// Best-effort: register a startup pack prefetch for the memory image at
+    /// `image_config`. The daemon deduplicates by pack identity and always
+    /// answers `Ok`; failures are logged daemon-side only.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prefetch_startup_pack(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        url: &str,
+        pack_size: u64,
+        index_sha256: &str,
+        mem_virtual_size: u64,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        let request = DaemonRequest::PrefetchStartupPack {
+            image_config: image_config.to_path_buf(),
+            global_config: global_config.to_path_buf(),
+            url: url.to_string(),
+            pack_size,
+            index_sha256: index_sha256.to_string(),
+            mem_virtual_size,
+            timeout_secs,
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error { message } => {
+                bail!("daemon: prefetch startup pack failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for prefetch startup pack: {other:?}"),
+        }
+    }
+
     /// Create an OverlayBD runtime config and acquire a ublk device for it.
     ///
     /// This is the sandbox rootfs/extra-drive path. The daemon owns runtime

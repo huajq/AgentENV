@@ -472,6 +472,11 @@ pub struct FirecrackerSnapshotConfig {
     /// custom-extension hooks are suppressed. Runtime-only, never persisted.
     #[serde(skip)]
     pub pack_recording: bool,
+    /// Startup manifest to prefetch for this resume (resolved by the OSS
+    /// resolver when consumption is enabled and the committed record carries
+    /// a manifest). Runtime-only, never persisted.
+    #[serde(skip)]
+    pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -558,6 +563,7 @@ impl FirecrackerSnapshotConfig {
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
             pack_recording: false,
+            memory_startup_pack: manifest.memory_startup_pack.clone(),
         })
     }
 
@@ -876,6 +882,7 @@ mod tests {
         .common;
         common.rootfs_virtual_size = Some(0);
         let mut snapshot = FirecrackerSnapshotConfig {
+            memory_startup_pack: None,
             common,
             vm_state_path: vm_state_path.clone(),
             mem_overlaybd_config: OverlaybdConfig {

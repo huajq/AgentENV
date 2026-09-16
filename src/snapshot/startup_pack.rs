@@ -137,6 +137,27 @@ pub struct ResolvedStartupPack {
     pub mem_virtual_size: u64,
 }
 
+/// Gate a committed descriptor into a runtime reference, only when
+/// consumption is enabled. Missing descriptors and disabled consumption
+/// fall back to plain on-demand resume; a manifest the consumer cannot
+/// parse (including an unknown format version) is skipped the same way.
+pub fn resolve_startup_pack_ref(
+    info: Option<&MemoryStartupPackInfo>,
+    consume_enabled: bool,
+    url: impl FnOnce() -> String,
+) -> Option<ResolvedStartupPack> {
+    if !consume_enabled {
+        return None;
+    }
+    let info = info?;
+    Some(ResolvedStartupPack {
+        url: url(),
+        pack_size: info.pack_size,
+        index_sha256: info.index_sha256.clone(),
+        mem_virtual_size: info.mem_virtual_size,
+    })
+}
+
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
@@ -178,16 +199,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_startup_pack_ref_gates_consumption_and_version() {
-        let v3_info = MemoryStartupPackInfo {
-            format_version: overlaybd::startup_manifest::MANIFEST_FORMAT_VERSION,
+    fn resolve_startup_pack_ref_gates_only_consumption() {
+        let info = MemoryStartupPackInfo {
             pack_size: 4096,
             mem_virtual_size: 1 << 30,
             index_sha256: "ab".repeat(32),
         };
-        // Consumption disabled → no reference, even for a v3 manifest.
+        // Consumption disabled → no reference.
         assert!(crate::snapshot::startup_pack::resolve_startup_pack_ref(
-            Some(&v3_info),
+            Some(&info),
             false,
             || "s3://b/k".to_string()
         )
@@ -198,25 +218,13 @@ mod tests {
                 .to_string())
             .is_none()
         );
-        // v1/v2 descriptors → best-effort skip on this branch.
-        for version in [1, 2] {
-            let legacy = MemoryStartupPackInfo {
-                format_version: version,
-                ..v3_info.clone()
-            };
-            assert!(crate::snapshot::startup_pack::resolve_startup_pack_ref(
-                Some(&legacy),
-                true,
-                || "s3://b/k".to_string()
-            )
-            .is_none());
-        }
-        // v3 + enabled → reference with descriptor fields.
+        // Any descriptor with consumption enabled resolves; the daemon
+        // rejects non-manifest objects by magic instead.
         let resolved =
-            crate::snapshot::startup_pack::resolve_startup_pack_ref(Some(&v3_info), true, || {
+            crate::snapshot::startup_pack::resolve_startup_pack_ref(Some(&info), true, || {
                 "s3://bucket/aenv-bk/artifacts/id/memory-startup.pack".to_string()
             })
-            .expect("v3 manifest with consumption enabled must resolve");
+            .expect("a descriptor with consumption enabled must resolve");
         assert_eq!(resolved.pack_size, 4096);
         assert_eq!(resolved.mem_virtual_size, 1 << 30);
         assert_eq!(resolved.index_sha256, "ab".repeat(32));

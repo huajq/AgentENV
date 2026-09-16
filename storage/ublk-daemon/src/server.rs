@@ -279,6 +279,11 @@ pub struct UblkDaemonServer {
     /// a time.
     resize_permit: Arc<Mutex<()>>,
     pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>,
+    /// Keep-alive list for in-flight startup pack prefetch tasks. Entries
+    /// are pruned on each new prefetch; a live task is never dropped here,
+    /// so a shared memory device's release never cancels a prefetch other
+    /// sandboxes may still want.
+    startup_pack_handles: Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
     shutdown: Arc<Notify>,
 }
 
@@ -328,6 +333,7 @@ impl UblkDaemonServer {
             resize_global_config,
             resize_permit: Arc::new(Mutex::new(())),
             pack_recordings: Arc::new(DashMap::new()),
+            startup_pack_handles: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -414,6 +420,7 @@ impl UblkDaemonServer {
                     let resize_global_config = self.resize_global_config.clone();
                     let resize_permit = Arc::clone(&self.resize_permit);
                     let pack_recordings = Arc::clone(&self.pack_recordings);
+                    let startup_pack_handles = Arc::clone(&self.startup_pack_handles);
                     let shutdown = Arc::clone(&self.shutdown);
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
@@ -426,6 +433,7 @@ impl UblkDaemonServer {
                             resize_global_config,
                             resize_permit,
                             pack_recordings,
+                            startup_pack_handles,
                             shutdown,
                         ).await {
                             tracing::error!(?err, "daemon connection handler failed");
@@ -522,6 +530,7 @@ async fn handle_connection(
     resize_global_config: PathBuf,
     resize_permit: Arc<Mutex<()>>,
     pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>,
+    startup_pack_handles: Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
@@ -617,6 +626,30 @@ async fn handle_connection(
         }
         DaemonRequest::AbortPackRecording { dev_id } => {
             handle_abort_pack_recording(&devices, &pack_recordings, dev_id).await
+        }
+        DaemonRequest::PrefetchStartupPack {
+            image_config,
+            global_config,
+            url,
+            pack_size,
+            index_sha256,
+            mem_virtual_size,
+            timeout_secs,
+        } => {
+            handle_prefetch_startup_pack(
+                &image_service_cache,
+                &startup_pack_handles,
+                image_config,
+                global_config,
+                overlaybd::image_service::StartupPackPrefetch {
+                    url,
+                    pack_size,
+                    index_sha256,
+                    mem_virtual_size,
+                    timeout: Duration::from_secs(timeout_secs),
+                },
+            )
+            .await
         }
         DaemonRequest::AcquireOverlaybd {
             image_config,
@@ -1032,6 +1065,55 @@ fn handle_pack_recording_status(
         .expect("recording state poisoned")
         .clone();
     Ok(DaemonResponse::PackRecording { state })
+}
+
+/// Best-effort startup pack prefetch registration. Every failure mode
+/// (missing image service, no bindable layers, shut-down scheduler) is
+/// logged and answered with `Ok`: resume never depends on the prefetch.
+async fn handle_prefetch_startup_pack(
+    image_service_cache: &Arc<ImageServiceCache>,
+    startup_pack_handles: &Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
+    image_config: PathBuf,
+    global_config: PathBuf,
+    pack: overlaybd::image_service::StartupPackPrefetch,
+) -> Result<DaemonResponse> {
+    let image_service = match image_service_cache.get_or_create(&global_config).await {
+        Ok(service) => service,
+        Err(error) => {
+            tracing::warn!(%error, "startup pack prefetch: image service unavailable");
+            return Ok(DaemonResponse::Ok);
+        }
+    };
+    match image_service
+        .prefetch_startup_pack(&image_config, pack)
+        .await
+    {
+        Ok(Some(handle)) => {
+            use overlaybd::backend::cache::StartupPackPhase;
+            let mut handles = startup_pack_handles.lock().await;
+            handles.retain(|existing| {
+                !matches!(
+                    existing.phase(),
+                    StartupPackPhase::Done | StartupPackPhase::Failed | StartupPackPhase::Canceled
+                )
+            });
+            handles.push(handle);
+            tracing::info!(
+                image_config = %image_config.display(),
+                "startup pack prefetch registered"
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                image_config = %image_config.display(),
+                "startup pack prefetch skipped: no bindable layers or cache"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "startup pack prefetch registration failed");
+        }
+    }
+    Ok(DaemonResponse::Ok)
 }
 
 /// Cancel one recording and remove its pack files deterministically: the

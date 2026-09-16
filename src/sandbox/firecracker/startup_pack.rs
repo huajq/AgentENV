@@ -283,6 +283,8 @@ mod tests {
                 record_max_window_ms: 2000,
                 record_budget_secs: 10,
                 max_pack_bytes: 1 << 30,
+                consume_enabled: false,
+                consume_timeout_secs: 30,
             }
         }
 

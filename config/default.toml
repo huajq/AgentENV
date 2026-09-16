@@ -249,6 +249,8 @@ workers = 1
 # upload a tiny v3 page manifest, and prefetch the listed positions
 # concurrently on cold resume. Pages not yet prefetched fall back to the
 # normal on-demand path immediately. `consume_enabled` only gates resume-side
+# consumption so A/B runs can compare the same snapshot with/without it;
+# `consume_timeout_secs` bounds a manifest's queueing plus download time.
 # [snapshot.memory_startup_pack]
 # enabled = false
 # record_min_window_ms = 200
@@ -256,6 +258,8 @@ workers = 1
 # record_max_window_ms = 2000
 # record_budget_secs = 10
 # max_pack_bytes = 1073741824
+# consume_enabled = false
+# consume_timeout_secs = 30
 
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.

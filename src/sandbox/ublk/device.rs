@@ -413,6 +413,43 @@ impl UblkDeviceManager {
         client.abort_pack_recording(dev_id).await
     }
 
+    /// Best-effort: ask the daemon to prefetch a v3 startup manifest for
+    /// the memory image. Never fails the resume: registration problems are
+    /// logged and swallowed here (the daemon logs execution failures).
+    pub(crate) async fn prefetch_startup_pack(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        pack: &crate::snapshot::ResolvedStartupPack,
+    ) {
+        let timeout_secs = crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .consume_timeout_secs;
+        let result = async {
+            let client = self.require_client()?;
+            client
+                .prefetch_startup_pack(
+                    image_config,
+                    global_config,
+                    &pack.url,
+                    pack.pack_size,
+                    &pack.index_sha256,
+                    pack.mem_virtual_size,
+                    timeout_secs,
+                )
+                .await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                %error,
+                image_config = %image_config.display(),
+                "startup pack prefetch registration failed (best-effort)"
+            );
+        }
+    }
+
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,

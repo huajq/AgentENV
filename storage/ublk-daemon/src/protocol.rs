@@ -78,6 +78,20 @@ pub enum DaemonRequest {
     AbortPackRecording {
         dev_id: u32,
     },
+    /// Best-effort: prefetch a v3 startup manifest for the memory image
+    /// at `image_config`, binding the manifest's layers to the image's OSS
+    /// lowers inside the cache of the `ImageService` for `global_config`.
+    /// Registration is deduplicated by pack identity; the daemon reports
+    /// failures in its log and always answers `Ok`.
+    PrefetchStartupPack {
+        image_config: PathBuf,
+        global_config: PathBuf,
+        url: String,
+        pack_size: u64,
+        index_sha256: String,
+        mem_virtual_size: u64,
+        timeout_secs: u64,
+    },
     /// Acquire a warm overlaybd device from the pool.
     AcquireOverlaybd {
         image_config: PathBuf,

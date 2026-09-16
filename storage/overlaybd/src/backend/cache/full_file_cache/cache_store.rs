@@ -1041,13 +1041,13 @@ impl CachedFile {
         Ok(self.missing_background_blocks(source_size)?.is_empty())
     }
 
-    /// Enumerate download chunks (`blocks_per_chunk` cache blocks each) that
-    /// still have at least one missing block, as `(start_block, len_blocks)`
+    /// Enumerate download chunks (`blocks_per_chunk` cache blocks each)
+    /// that have at least one block missing, as `(start_block, len_blocks)`
     /// pairs; the final chunk may be shorter. The download chunk is the
-    /// background fetch granularity (`download.blockSize`) expressed in cache
-    /// blocks — the cache itself keeps storing and exposing blocks in its own
-    /// smaller block size.
-    pub(crate) fn missing_background_chunks(
+    /// background fetch granularity (`download.blockSize`) expressed in
+    /// cache blocks — the cache itself keeps storing and exposing blocks in
+    /// its own smaller block size.
+    pub(crate) fn actionable_background_chunks(
         &self,
         source_size: u64,
         blocks_per_chunk: u32,
@@ -1063,8 +1063,9 @@ impl CachedFile {
         let mut start = 0u64;
         while start < block_count {
             let len = (block_count - start).min(blocks_per_chunk);
-            let has_missing = (start..start + len).any(|block_id| !index.contains(block_id as u32));
-            if has_missing {
+            let has_actionable =
+                (start..start + len).any(|block_id| !index.contains(block_id as u32));
+            if has_actionable {
                 chunks.push((start, u32::try_from(len)?));
             }
             start += len;

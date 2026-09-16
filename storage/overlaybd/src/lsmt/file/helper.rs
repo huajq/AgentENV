@@ -1029,7 +1029,7 @@ async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<Read
     })
 }
 
-pub(super) async fn load_readonly_layers_metadata(
+pub(crate) async fn load_readonly_layers_metadata(
     files: &[Arc<dyn VirtualFile>],
 ) -> Result<Vec<ReadOnlyLayerMetadata>> {
     let s = stream::iter(files.iter().cloned().enumerate())

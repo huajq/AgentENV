@@ -50,6 +50,11 @@ pub struct SandboxSnapshotManifest {
     /// Launch-time volumes use the reserved slots that follow these drives.
     #[serde(default)]
     pub physical_extra_drive_count: usize,
+    /// Runtime-only startup pack reference resolved from the committed
+    /// record (OSS backend, consumption enabled). Absent for older
+    /// snapshots, v1 packs, POSIX backends, and disabled consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +128,7 @@ impl SandboxSnapshotManifest {
             attached_drives: Vec::new(),
             volume_drive_slots: 0,
             physical_extra_drive_count: attached_drives.len(),
+            memory_startup_pack: None,
         }
         .with_extra_drives(attached_drives)
     }
@@ -254,10 +260,25 @@ mod tests {
             attached_drives: vec![known],
             volume_drive_slots: 0,
             physical_extra_drive_count: 1,
+            memory_startup_pack: None,
         };
 
         let drives = manifest.extra_drives();
         assert_eq!(drives[0].virtual_size(), Some(4096));
+    }
+
+    #[test]
+    fn manifest_without_memory_startup_pack_parses_as_none() {
+        let json = serde_json::json!({
+            "version": MANIFEST_FORMAT_VERSION,
+            "vmState": {},
+            "memory": { "virtualSize": 4096 },
+            "rootfs": { "virtualSize": 4096 },
+            "attachedDrives": [],
+        });
+        let manifest: SandboxSnapshotManifest =
+            serde_json::from_value(json).expect("old manifest must parse");
+        assert!(manifest.memory_startup_pack.is_none());
     }
 
     #[test]

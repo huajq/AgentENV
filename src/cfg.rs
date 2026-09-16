@@ -421,6 +421,16 @@ pub struct SnapshotStartupPackConfig {
     /// Per-pack page-data cap (hard truncation in the pack writer).
     #[config(default = 1073741824u64)]
     pub max_pack_bytes: u64,
+    /// Consume startup manifests at resume time (A/B switch, independent of
+    /// recording): register the manifest's layers with the shared layer cache
+    /// and prefetch their listed blocks. Legacy v1/v2 records and missing
+    /// descriptors always fall back to plain on-demand resume.
+    #[config(default = false)]
+    pub consume_enabled: bool,
+    /// Hard bound on a manifest's queueing plus download time; an overdue
+    /// manifest fails and resume proceeds on-demand.
+    #[config(default = 30u64)]
+    pub consume_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]

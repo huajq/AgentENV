@@ -731,6 +731,7 @@ mod client_tests {
                     state: PackRecordingState::Recording,
                 },
                 DaemonRequest::AbortPackRecording { .. } => DaemonResponse::Ok,
+                DaemonRequest::PrefetchStartupPack { .. } => DaemonResponse::Ok,
             }
         }))
         .await;

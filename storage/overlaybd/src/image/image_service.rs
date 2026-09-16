@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::backend::cache::{
     BkDownloadSubmitError, CacheFnTransFunc, CachedFile, FileCacheBackend, FileCacheBackendOptions,
+    StartupPackHandle, StartupPackLayer, StartupPackSubmission,
 };
 use crate::backend::local::LocalFile;
 use crate::backend::oss::OssBackend;
@@ -420,6 +421,55 @@ impl ImageService {
         }
     }
 
+    /// Register a v2 startup memory pack prefetch for the memory image at
+    /// `image_config_path`: binds the pack's objects to the image's OSS
+    /// lowers through the same cache entries the on-demand path uses, then
+    /// hands the download to the cache scheduler. Returns `None` (no pack)
+    /// when the image has no bindable OSS lowers or the cache backend is
+    /// missing. The prefetch is best-effort: on-demand reads and background
+    /// downloads proceed regardless.
+    pub async fn prefetch_startup_pack(
+        &self,
+        image_config_path: impl AsRef<Path>,
+        pack: StartupPackPrefetch,
+    ) -> Result<Option<StartupPackHandle>> {
+        let remote_runtime = self.remote_runtime().await?;
+        let Some(cache) = remote_runtime.file_cache.as_ref() else {
+            return Ok(None);
+        };
+        let image_config = self.load_image_config(image_config_path.as_ref())?;
+        let Some(refs) = collect_startup_pack_layers(&image_config) else {
+            return Ok(None);
+        };
+        let mut layers = Vec::with_capacity(refs.len());
+        for (url, digest, size) in refs {
+            let source = self.open_backend_source_with_size(&url, Some(size)).await?;
+            let file = Self::open_cached_blob(cache, &url, source.clone(), Some(size)).await?;
+            layers.push(StartupPackLayer {
+                digest,
+                size,
+                file,
+                source,
+            });
+        }
+        // The pack object itself bypasses the file cache: it is consumed
+        // exactly once, and only its layer blocks belong in the cache. The
+        // size hint avoids a stat probe.
+        let pack_source = self
+            .open_backend_source_with_size(&pack.url, Some(pack.pack_size))
+            .await?;
+        let handle = cache.submit_startup_pack(StartupPackSubmission {
+            task_key: format!("startup-pack:{}", pack.index_sha256),
+            pack_source,
+            pack_size: pack.pack_size,
+            index_sha256: pack.index_sha256,
+            mem_virtual_size: pack.mem_virtual_size,
+            layers,
+            timeout: pack.timeout,
+        })?;
+        Ok(Some(handle))
+    }
+
     async fn open_cached_blob(
         cache: &FileCacheBackend,
         url: &str,
@@ -544,6 +594,47 @@ impl ImageService {
     }
 }
 
+/// Parameters for one startup pack prefetch (see
+/// [`ImageService::prefetch_startup_pack`]).
+pub struct StartupPackPrefetch {
+    pub url: String,
+    pub pack_size: u64,
+    pub index_sha256: String,
+    pub mem_virtual_size: u64,
+    /// Hard bound on queueing plus downloading.
+    pub timeout: std::time::Duration,
+}
+
+/// Collect the OSS lowers of a memory image config as `(url, digest, size)`
+/// in bottom-to-top order, with URLs built exactly like the image-open path
+/// (`{repo_blob_url}/{digest}`). Returns `None` when any lower cannot be
+/// bound (no remote URL, missing descriptor, or a non-OSS URL): the pack
+/// binds by exact object-table match, so a partial binding is useless.
+fn collect_startup_pack_layers(image_config: &ImageConfig) -> Option<Vec<(String, String, u64)>> {
+    if image_config.lowers.is_empty() {
+        return None;
+    }
+    let mut refs = Vec::with_capacity(image_config.lowers.len());
+    for lower in &image_config.lowers {
+        // A local-file lower is read from local bytes, not from the OSS
+        // object: prefetching that object would warm a cache the device
+        // never touches.
+        if !lower.file.is_empty() {
+            return None;
+        }
+        let base = lower.effective_repo_blob_url(&image_config.repo_blob_url);
+        if base.is_empty() || lower.digest.is_empty() || lower.size == 0 {
+            return None;
+        }
+        let url = format!("{}/{}", base.trim_end_matches('/'), lower.digest);
+        if !ImageService::is_oss_url(&url) {
+            return None;
+        }
+        refs.push((url, lower.digest.clone(), lower.size));
+    }
+    Some(refs)
+}
+
 fn check_accelerate_url(address: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(address) else {
         return false;
@@ -582,6 +673,86 @@ mod tests {
             serde_json::to_vec_pretty(value).expect("serialize json"),
         )
         .expect("write json");
+    }
+
+    fn remote_lower(digest: &str, size: u64) -> crate::config::LayerConfig {
+        crate::config::LayerConfig {
+            digest: digest.to_string(),
+            size,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn startup_pack_layers_builds_urls_like_image_open() {
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/aenv-bk/managed-layers".to_string(),
+            lowers: vec![
+                remote_lower("sha256:aa", 100),
+                remote_lower("sha256:bb", 200),
+            ],
+            ..Default::default()
+        };
+        let refs = collect_startup_pack_layers(&config).expect("all remote lowers bind");
+        assert_eq!(
+            refs,
+            vec![
+                (
+                    "s3://bucket/aenv-bk/managed-layers/sha256:aa".to_string(),
+                    "sha256:aa".to_string(),
+                    100
+                ),
+                (
+                    "s3://bucket/aenv-bk/managed-layers/sha256:bb".to_string(),
+                    "sha256:bb".to_string(),
+                    200
+                ),
+            ]
+        );
+
+        // A per-layer repo_blob_url wins over the config-level base.
+        let mut layered = remote_lower("sha256:cc", 300);
+        layered.repo_blob_url = "s3://bucket/other".to_string();
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/aenv-bk/managed-layers".to_string(),
+            lowers: vec![layered],
+            ..Default::default()
+        };
+        let refs = collect_startup_pack_layers(&config).expect("layer-level url binds");
+        assert_eq!(refs[0].0, "s3://bucket/other/sha256:cc");
+    }
+
+    #[test]
+    fn startup_pack_layers_rejects_unbindable_lowers() {
+        // Empty lowers.
+        assert!(collect_startup_pack_layers(&ImageConfig::default()).is_none());
+        // Local-file lower (no remote identity).
+        let local = crate::config::LayerConfig {
+            file: "/layers/a.commit".to_string(),
+            digest: "sha256:aa".to_string(),
+            size: 100,
+            ..Default::default()
+        };
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/prefix".to_string(),
+            lowers: vec![local],
+            ..Default::default()
+        };
+        assert!(collect_startup_pack_layers(&config).is_none());
+        // Missing descriptor.
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/prefix".to_string(),
+            lowers: vec![crate::config::LayerConfig::default()],
+            ..Default::default()
+        };
+        assert!(collect_startup_pack_layers(&config).is_none());
+        // Non-OSS URL scheme.
+        let config = ImageConfig {
+            repo_blob_url: "https://registry/v2/repo/blobs".to_string(),
+            lowers: vec![remote_lower("sha256:aa", 100)],
+            ..Default::default()
+        };
+        assert!(collect_startup_pack_layers(&config).is_none());
     }
 
     async fn spawn_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {

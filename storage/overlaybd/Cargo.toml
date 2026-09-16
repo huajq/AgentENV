@@ -57,6 +57,10 @@ metrics-util = { version = "0.20.4", default-features = false, features = ["debu
 name = "generate_image_config"
 required-features = ["full"]
 
+[[example]]
+name = "pack_plan_stats"
+required-features = ["full"]
+
 [[bench]]
 name = "zfile_read"
 path = "benches/zfile_read_benchmark.rs"

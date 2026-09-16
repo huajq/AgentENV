@@ -859,6 +859,19 @@ impl ZFileRO {
         self.ht.opt
     }
 
+    /// Compressed extent `(offset, len)` of the zfile block covering
+    /// `logical_offset`. Read-only metadata query for publish-side planning;
+    /// does not read or decompress any payload.
+    pub fn compressed_block_extent(&self, logical_offset: u64) -> Result<(u64, u64)> {
+        let block_size = u64::from(self.options().block_size);
+        ensure!(block_size != 0, "zfile block size is zero");
+        let idx =
+            usize::try_from(logical_offset / block_size).context("zfile block index overflow")?;
+        let begin = self.jump_table.offset_at(idx)?;
+        let end = self.jump_table.offset_at(idx + 1)?;
+        Ok((begin, end.saturating_sub(begin)))
+    }
+
     pub fn set_crc_check_only(&mut self) {
         self.valid_mode = ValidMode::CrcOnly;
     }
